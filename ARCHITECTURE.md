@@ -42,3 +42,9 @@
 - 编排层：纯 Python 脚本（后期可平滑迁移至 LangGraph）
 - 模型层：`/core/llm_client.py` 封装的 Gemini 接口
 - 执行层：本地沙盒 + `pytest`
+
+## 4. V2.0 升级：引入 Prime Agent 递归与自愈机制
+在 V2.0 版本中，我们借鉴了 Prime Agent 在 ARC-AGI-3 霸榜的核心思���，完成了以下架构演进：
+1. **Persistent Orchestration (持久化协同)**：QA 节点和 Coder 节点不再是单向传值，人类打回测试用例时，QA Agent 会根据反馈上下文持续迭代，形成闭环。
+2. **Recursive REPL (递归执行沙盒)**：Coder 生成业务代码后不再直接交付，而是自动挂载到本地沙盒运行 `pytest`。
+3. **Traceback Self-Healing (基于报错栈的自愈)**：当 `pytest` 失败时，捕获终端报错日志（stdout/stderr），自动拼接成新 Prompt 回传给 Coder Agent，强制其修复代码。实现“不 Pass 不交付”的绝对防御。
