@@ -9,7 +9,10 @@ class LLMClient:
         # 缺 key 在这里直接报错，早失败早排查
         if not GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY 未配置，请检查 .env")
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        self.client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options={"base_url": "http://localhost:3403"}
+        )
 
     # ---- 纯文本 chat（兼容旧 main.py 调用面）----
     def chat(self, prompt: str, system_prompt: str = "") -> str:
