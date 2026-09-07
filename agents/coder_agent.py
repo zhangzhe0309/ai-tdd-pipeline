@@ -3,6 +3,7 @@
 模型用工具操作环境（读 traceback、写 biz_logic、跑 pytest），
 而不是把日志/代码全塞进 prompt。
 """
+import logging
 from pathlib import Path
 from google.genai import types
 from core.agent import Agent, AgentResult
@@ -11,6 +12,8 @@ from tools.pytest_runner import run_pytest
 from memory import failure_store
 import config
 
+logger = logging.getLogger(__name__)
+
 
 # 工具的 FunctionDeclaration（告诉模型有哪些工具可用）
 _TOOLS = [
@@ -18,7 +21,7 @@ _TOOLS = [
         name="read_file",
         description="读取指定路径文件内容（如读取 traceback.log 了解报错）",
         parameters=types.Schema(type="OBJECT", properties={
-            "path": types.Schema(type="STRING", description="文件绝对路径"),
+            "path": types.Schema(type="STRING", description="文件路径"),
         }, required=["path"]),
     ),
     types.FunctionDeclaration(
@@ -40,46 +43,66 @@ _TOOLS = [
 ]
 
 
+def _is_safe(p: str, run_dir: Path) -> bool:
+    """确保路径在 run_dir 内，相对路径基于 run_dir 解析（而非 cwd）。"""
+    if not p:
+        return False
+    try:
+        base = run_dir.resolve()
+        path = Path(p)
+        if path.is_absolute():
+            target = path.resolve()
+        else:
+            # 相对路径基于 run_dir，避免 cwd 污染
+            target = (run_dir / path).resolve()
+        return target.is_relative_to(base)
+    except (ValueError, OSError):
+        return False
+
+
 def _dispatch(name: str, args: dict, run_dir: Path) -> dict:
     """把模型发的工具调用路由到真实函数。run_dir 用于路径约束与 pytest 落盘。"""
-    def _is_safe(p: str) -> bool:
-        try:
-            return Path(p).resolve().is_relative_to(run_dir.resolve())
-        except ValueError:
-            return False
-
     if name == "read_file":
         path = args.get("path")
-        if not path: return {"error": "Missing 'path' parameter"}
-        if not _is_safe(path): return {"error": f"Path traversal denied: {path} is outside run_dir"}
+        if not path:
+            return {"error": "Missing 'path' parameter"}
+        if not _is_safe(path, run_dir):
+            return {"error": "Path traversal denied"}
         return read_file(path)
-        
+
     if name == "write_file":
         path = args.get("path")
         content = args.get("content", "")
-        if not path: return {"error": "Missing 'path' parameter"}
-        if not _is_safe(path): return {"error": f"Path traversal denied: {path} is outside run_dir"}
+        if not path:
+            return {"error": "Missing 'path' parameter"}
+        if not _is_safe(path, run_dir):
+            return {"error": "Path traversal denied"}
         return write_file(path, content)
-        
+
     if name == "run_pytest":
         test_file = args.get("test_file")
         cwd = args.get("cwd")
-        if not test_file or not cwd: return {"error": "Missing 'test_file' or 'cwd' parameter"}
-        if not _is_safe(test_file) or not _is_safe(cwd):
-            return {"error": "Security exception: test_file and cwd must be within run_dir"}
-            
+        if not test_file or not cwd:
+            return {"error": "Missing 'test_file' or 'cwd' parameter"}
+        if not _is_safe(test_file, run_dir) or not _is_safe(cwd, run_dir):
+            return {"error": "Security exception: paths must be within run_dir"}
+
         res = run_pytest(test_file, cwd, timeout=config.PYTEST_TIMEOUT_SEC)
-        # RLM 关键：长输出落盘，只把摘要回给模型；模型用 read_file 看细节
+        # RLM 关键：长输出落盘，只把摘要回给模型
         log_path = run_dir / "traceback.log"
-        # 优化点：直接返回错误日志的最后10行，避免必须请求read_file
         tail = "\n".join(res["output"].splitlines()[-10:])
-        log_path.write_text(res["output"], encoding="utf-8")
+        try:
+            log_path.write_text(res["output"], encoding="utf-8")
+        except OSError:
+            pass
         return {
             "passed": res["passed"],
             "output_path": str(log_path),
-            "hint": f"完整输出已写入 output_path。这里是最后十行摘要:\n{tail}" if not res["passed"] else "",
+            "hint": (f"完整输出已写入 output_path。"
+                     f"这里是最后十行摘要:\n{tail}") if not res["passed"] else "",
         }
-    return {"error": f"未知工具: {name}"}
+
+    return {"error": f"Unknown tool: {name}"}
 
 
 class CoderAgent(Agent):
@@ -104,10 +127,16 @@ class CoderAgent(Agent):
         # 先跑一次拿初始 traceback
         first = run_pytest(str(test_path), str(run_dir))
         if not first["passed"]:
-            (run_dir / "traceback.log").write_text(first["output"], encoding="utf-8")
+            try:
+                (run_dir / "traceback.log").write_text(
+                    first["output"], encoding="utf-8"
+                )
+            except OSError:
+                pass
             mem = failure_store.query(first["output"])
             if mem:
-                hint = f"\n\n[经验记忆] 同类错误曾出现 {mem['hits']} 次，当时修复思路：{mem['fix_summary']}"
+                hint = (f"\n\n[经验记忆] 同类错误曾出现 {mem['hits']} 次，"
+                        f"当时修复思路：{mem['fix_summary']}")
 
         # 3. function-calling 自愈循环
         prompt = (
@@ -120,13 +149,23 @@ class CoderAgent(Agent):
         )
 
         # 4. 验证最终产物
-        biz_code = biz_path.read_text(encoding="utf-8") if biz_path.exists() else ""
+        biz_code = ""
+        if biz_path.exists():
+            try:
+                biz_code = biz_path.read_text(encoding="utf-8")
+            except OSError:
+                pass
         last = run_pytest(str(test_path), str(run_dir))
         if last["passed"]:
-            # 成功 → 落盘经验记忆
-            if first["passed"] is False and first["output"]:
-                failure_store.record(first["output"], f"最终通过；末态代码见 {biz_path}")
-            return AgentResult(success=True, output=biz_code, detail="测试全绿，已交付")
+            # 成功 → 落盘经验记忆（首次失败场景）
+            if not first["passed"] and first["output"]:
+                failure_store.record(
+                    first["output"], f"最终通过；末态代码见 {biz_path}"
+                )
+            return AgentResult(success=True, output=biz_code,
+                               detail="测试全绿，已交付")
         # 失败
-        return AgentResult(success=False, output=biz_code,
-                           detail=f"达到最大迭代仍未通过。末次输出见 {run_dir}/traceback.log")
+        return AgentResult(
+            success=False, output=biz_code,
+            detail=f"达到最大迭代仍未通过。末次输出见 {run_dir}/traceback.log"
+        )

@@ -1,6 +1,31 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
 .venv/
+venv/
+
+# Environment
 .env
+*.env.local
+
+# Workspace (generated outputs)
+workspace/biz_logic.py
+workspace/features.md
+workspace/test_biz_logic.py
 workspace/runs/
+
+# Logs
 *.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Tests
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
